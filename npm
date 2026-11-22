@@ -1,0 +1,6 @@
+
+> cicd-demo-app@1.0.0 start
+> node src/server.js test
+
+App listening on port 3000
+Terminate batch job (Y/N)? 

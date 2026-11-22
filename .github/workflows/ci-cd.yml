@@ -1,0 +1,143 @@
+name: CI/CD Pipeline
+
+# Code Change -> Git Push -> Unit Test -> Build -> Artifact -> S3 -> Deploy -> Production
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  S3_BUCKET: ${{ secrets.S3_BUCKET }}
+
+jobs:
+  # ---------------------------------------------------------------
+  # 1) Unit tests - the pipeline FAILS here if any test fails
+  # ---------------------------------------------------------------
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  # ---------------------------------------------------------------
+  # BONUS (DevSecOps) - dependency scan + secret scan, run in parallel with tests
+  # ---------------------------------------------------------------
+  security:
+    name: Security Scan (npm audit + Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Dependency vulnerability scan (fails on high/critical)
+        run: npm audit --omit=dev --audit-level=high
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------
+  # 2) Build the package and upload it to S3
+  # ---------------------------------------------------------------
+  build:
+    name: Build and Upload to S3
+    needs: [test, security]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Build artifact
+        run: bash scripts/build.sh "${{ github.run_number }}" "${{ github.sha }}"
+
+      - name: Keep a copy on GitHub too (optional, visible in the Actions UI)
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact
+          path: build-*.zip
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Upload versioned build + mark it as latest in S3
+        run: |
+          ARTIFACT="$(cat artifact-name.txt)"
+          aws s3 cp "$ARTIFACT" "s3://${S3_BUCKET}/builds/${ARTIFACT}"
+          # "latest" pointer is only updated AFTER a successful upload
+          aws s3 cp "s3://${S3_BUCKET}/builds/${ARTIFACT}" "s3://${S3_BUCKET}/latest/build-latest.zip"
+          echo "### Uploaded to S3" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`s3://${S3_BUCKET}/builds/${ARTIFACT}\`" >> "$GITHUB_STEP_SUMMARY"
+          aws s3 ls "s3://${S3_BUCKET}/builds/" >> "$GITHUB_STEP_SUMMARY" || true
+
+  # ---------------------------------------------------------------
+  # 3) Deploy: EC2 pulls the LATEST build from S3 (via AWS SSM, no SSH needed)
+  # ---------------------------------------------------------------
+  deploy:
+    name: Deploy Latest Build from S3 to EC2
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Tell EC2 to download latest build from S3 and restart the app
+        run: |
+          { echo "export BUCKET='${S3_BUCKET}'"; echo "export AWS_DEFAULT_REGION='${AWS_REGION}'"; cat aws/remote-deploy.sh; } > /tmp/remote.sh
+          jq -n --rawfile s /tmp/remote.sh '{commands: [$s]}' > /tmp/params.json
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy build ${{ github.run_number }}" \
+            --parameters file:///tmp/params.json \
+            --query "Command.CommandId" --output text)
+          echo "SSM command id: $CMD_ID"
+
+          # Wait for completion (fails the job if the deploy script fails)
+          aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" || true
+          STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --query Status --output text)
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --query StandardOutputContent --output text
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --query StandardErrorContent --output text
+          [ "$STATUS" = "Success" ] || { echo "Deployment status: $STATUS"; exit 1; }
+
+      - name: Verify production is serving this build
+        run: |
+          URL="http://${{ secrets.EC2_PUBLIC_IP }}"
+          for i in $(seq 1 10); do
+            BODY=$(curl -fs "$URL/api/info" || true)
+            echo "Attempt $i: $BODY"
+            echo "$BODY" | grep -q "\"build\":\"${{ github.run_number }}\"" && { echo "Production is live with build ${{ github.run_number }}"; echo "### Live at $URL (build #${{ github.run_number }})" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+            sleep 5
+          done
+          echo "Production is not serving the new build"; exit 1
